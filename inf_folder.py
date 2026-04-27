@@ -13,14 +13,11 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from torch.hub import download_url_to_file
 import argparse
 from tqdm import tqdm
-
+import time
 
 # ----------------------------
 # Hardcoded prompt + hyperparams (keep same as now)
 # ----------------------------
-# NOTE: STOPPED this hardcode!
-# TARGET_W = 512
-# TARGET_H = 512
 
 SEED  = 42
 STEPS = 25
@@ -190,6 +187,20 @@ t2i_pipe = StableDiffusionPipeline(
 ).to(device)
 
 
+
+def center_crop_pil(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    w, h = img.size
+    if w < target_w or h < target_h:
+        scale = max(target_w / w, target_h / h)
+        new_w = int(round(w * scale))
+        new_h = int(round(h * scale))
+        img = img.resize((new_w, new_h), Image.BICUBIC)
+        w, h = img.size
+    left = (w - target_w) // 2
+    top  = (h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
 # ----------------------------
 # Args (ONLY dirs; no extra knobs)
 # ----------------------------
@@ -201,11 +212,15 @@ def parse_args():
         required=True,
         choices=["noon_sunlight_1", "golden_sunlight_1", "foggy_1", "moonlight_1"],
     )
-    parser.add_argument("--input_dir", type=str, default="/home/shenzhen/Datasets/VITON/test/image")
-    parser.add_argument("--mask_dir", type=str, default="/home/shenzhen/Datasets/VITON/test/fg_masks")
+    parser.add_argument("--input_dir", type=str, default="/ssd0/shenzhen/Datasets/VITON/test_sample_100/image")
+    parser.add_argument("--mask_dir", type=str, default="/ssd0/shenzhen/Datasets/VITON/test_sample_100/fg_masks")
     parser.add_argument("--out_root", type=str, default="./outputs")
+    parser.add_argument("--subdir", type=str, default="VITON/test/image")
     parser.add_argument("--image_width", type=int, default=512)
     parser.add_argument("--image_height", type=int, default=512)
+    parser.add_argument("--center_crop", action="store_true")
+    parser.add_argument("--crop_width", type=int, default=784)
+    parser.add_argument("--crop_height", type=int, default=784)
     return parser.parse_args()
 
 
@@ -218,6 +233,8 @@ def main():
     # NOTE: read target width and height from args
     TARGET_W = args.image_width
     TARGET_H = args.image_height
+    CROP_W = args.crop_width
+    CROP_H = args.crop_height  
 
     relighting_prompts_6 = {
         "noon_sunlight_1": "Relit with bright noon sunlight in a clear outdoor setting, casting soft natural shadows and surrounding the subject in crisp white light to create a clean, vibrant daytime mood.",
@@ -229,7 +246,7 @@ def main():
     PROMPT = relighting_prompts_6[args.relight_type]
     input_dir = args.input_dir
     mask_dir = args.mask_dir
-    output_dir = f"{args.out_root}/{TARGET_W}x{TARGET_H}/{args.relight_type}/VITON/test/image"
+    output_dir = f"{args.out_root}/{TARGET_W}x{TARGET_H}/{args.relight_type}/{args.subdir}"
     os.makedirs(output_dir, exist_ok=True)
 
     fnames = sorted(os.listdir(input_dir))
@@ -249,32 +266,69 @@ def main():
 
     rng = torch.Generator(device=device).manual_seed(int(SEED))
 
+    valid_count = 0
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+
     for fname in tqdm(fnames, desc=f"Relighting [{args.relight_type}]"):
         if not fname.lower().endswith((".jpg", ".png", ".jpeg")):
             continue
 
         base = os.path.splitext(fname)[0]
         img_path = os.path.join(input_dir, fname)
-        mask_path = os.path.join(mask_dir, base + ".png")
-        if not os.path.exists(mask_path):
-            continue
+
+
+        # mask_path = os.path.join(mask_dir, base + ".png")
+        # if not os.path.exists(mask_path):
+        #     continue
+
+        # img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        # if img_bgr is None:
+        #     continue
+        # img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        # m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        # if m is None:
+        #     continue
 
         img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        if m is None:
-            continue
+        m = None
+        if not args.center_crop:
+            mask_path = os.path.join(mask_dir, base + ".png")
+            if not os.path.exists(mask_path):
+                continue
+            m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if m is None:
+                continue
 
-        # 1) Crop to FG bbox
-        crop_rgb, _, bbox, crop_size = bbox_crop_by_mask(img_rgb, m)
-        if bbox is None:
-            continue
 
-        # 2) Resize cropped region to 512x512
-        in_512 = resize_without_crop(crop_rgb, TARGET_W, TARGET_H)
+
+        # # 1) Crop to FG bbox
+        # crop_rgb, _, bbox, crop_size = bbox_crop_by_mask(img_rgb, m)
+        # if bbox is None:
+        #     continue
+
+        # # 2) Resize cropped region to 512x512
+        # in_512 = resize_without_crop(crop_rgb, TARGET_W, TARGET_H)
+
+        if args.center_crop:
+            # center-crop to CROP_W x CROP_H (e.g. 784), then resize to TARGET (e.g. 512)
+            pil_img = Image.fromarray(img_rgb).convert("RGB")
+            pil_crop = center_crop_pil(pil_img, CROP_W, CROP_H)
+            crop_size = (CROP_W, CROP_H)          # (W,H) BEFORE resizing
+            crop_rgb  = np.array(pil_crop)
+            in_512 = resize_without_crop(crop_rgb, TARGET_W, TARGET_H)
+        else:
+            crop_rgb, _, bbox, crop_size = bbox_crop_by_mask(img_rgb, m)
+            if bbox is None:
+                continue
+            in_512 = resize_without_crop(crop_rgb, TARGET_W, TARGET_H)
+
+
 
         # 3) concat_conds = VAE(fg_512) latent
         fg_tensor = numpy2pytorch([in_512]).to(device=vae.device, dtype=vae.dtype)
@@ -301,7 +355,20 @@ def main():
 
         # Save final crop output
         out_bgr = cv2.cvtColor(out_restore, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(os.path.join(output_dir, fname), out_bgr)
+        # cv2.imwrite(os.path.join(output_dir, fname), out_bgr)
+        out_path = os.path.join(output_dir, base + ".png")
+        cv2.imwrite(out_path, out_bgr)
+
+        valid_count += 1
+
+    torch.cuda.synchronize()
+    end_time = time.perf_counter()
+    total_time = end_time - start_time
+
+    print(f"\n⏱ Total inference time: {total_time:.2f} seconds")
+    if valid_count > 0:
+        print(f"⏱ Average time per image: {total_time / valid_count:.3f} seconds")
+        print(f"⏱ Number of processed images: {valid_count}")
 
 
 if __name__ == "__main__":
